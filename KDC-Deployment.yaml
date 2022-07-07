@@ -1,0 +1,654 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy EC2 instances with MIT Kerberos with Replication
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Can contain only ASCII characters.
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - m1.small
+      - m1.medium
+      - m1.large
+      - m1.xlarge
+      - m2.xlarge
+      - m2.2xlarge
+      - m2.4xlarge
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m3.2xlarge
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - m4.10xlarge
+      - c1.medium
+      - c1.xlarge
+      - c3.large
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - c3.8xlarge
+      - c4.large
+      - c4.xlarge
+      - c4.2xlarge
+      - c4.4xlarge
+      - c4.8xlarge
+      - g2.2xlarge
+      - g2.8xlarge
+      - r3.large
+      - r3.xlarge
+      - r3.2xlarge
+      - r3.4xlarge
+      - r3.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+      - i2.4xlarge
+      - i2.8xlarge
+      - d2.xlarge
+      - d2.2xlarge
+      - d2.4xlarge
+      - d2.8xlarge
+      - hi1.4xlarge
+      - hs1.8xlarge
+      - cr1.8xlarge
+      - cc2.8xlarge
+      - cg1.4xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  VPCId:
+    Description: The VPC  where the EC2 instances will be launched on
+    Type: AWS::EC2::VPC::Id
+  HAforKdc:
+    Description:  Need High Availability for KDC ? True will set up two EC2 instances with KDC DB replication
+    Type: String
+    Default: 'True'
+    AllowedValues:
+      - 'True'
+      - 'False'
+  SubnetIdPrimary:
+    Description: Subnet for the Primary KDC Node (Use Private Subnet)
+    Type: AWS::EC2::Subnet::Id
+  SubnetIdSecondary:
+    Description: Subnet for the Secondary Node (Use Private Subnet & Diff AZ for better availability )
+    Type: AWS::EC2::Subnet::Id
+  KDCMasterDBPassword:
+    NoEcho: 'true'
+    Description: KDC DB master password
+    Type: String
+    MinLength: '1'
+    MaxLength: '41'
+    AllowedPattern: ^[a-zA-Z0-9#@$?]*$
+  KAdminPassword:
+    NoEcho: 'true'
+    Description: KAdmin password which will be used for Kadmin/admin pricipal in realm
+    Type: String
+    MinLength: '1'
+    MaxLength: '41'
+    AllowedPattern: ^[a-zA-Z0-9#@$?]*$
+  RealmName:
+    Description: 'Realm Name - Domain Name with block letters Eg:  EC2.INTERNAL'
+    Type: String
+    MinLength: '1'
+    MaxLength: '41'
+    AllowedPattern: ^[A-Z0-9]*.*[A-Z0-9]$
+Conditions:
+  HAEnabled: !Equals
+    - !Ref HAforKdc
+    - 'True'
+Resources:
+  KDCReplicaInstance:
+    Condition: HAEnabled
+    Type: AWS::EC2::Instance
+    DependsOn: KDCPrimaryInstance
+    Properties:
+      UserData:
+        # runs the cfn-init scripts
+        Fn::Base64:
+          !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum -y install krb5-server krb5-workstation krb5-libs
+          mkdir -p /var/lib/sss/pubconf/krb5.include.d/;mkdir -p /var/log/kerberos
+          aws ssm get-parameter --region ${AWS::Region} --name PrimaryKdcSshKey --query Parameter.Value --output text >> /root/.ssh/authorized_keys
+          aws ssm send-command \
+              --instance-ids ${KDCPrimaryInstance} \
+              --document-name "AWS-RunShellScript" \
+              --region ${AWS::Region} \
+              --parameters '{"commands":["KDC_REPLICA=$(aws ssm get-parameter --region ${AWS::Region} --name ReplicaKdcFqdn --query Parameter.Value --output text)","scp -p -o StrictHostKeyChecking=no /etc/krb5.conf root@$KDC_REPLICA:/etc/krb5.conf","scp -p -o StrictHostKeyChecking=no /var/kerberos/krb5kdc/kdc.conf root@$KDC_REPLICA:/var/kerberos/krb5kdc/kdc.conf","sed -i 's/replicahostname/\$KDC_REPLICA/g' /root/propagate_kdc_replica.sh"]}'
+          sleep 30
+          set +x
+          DB_PASS=$(aws secretsmanager --region ${AWS::Region} get-secret-value --secret-id ${SecretManagerMasterDbPassword} --query "SecretString" --output text);kdb5_util create -P $DB_PASS -s
+          KADMIN_PASS=$(aws secretsmanager --region ${AWS::Region} get-secret-value --secret-id ${SecretManagerKadminPassword} --query "SecretString" --output text);kadmin -p kadmin/admin -w $KADMIN_PASS -q "add_principal -randkey host/$(hostname -f)";kadmin -p kadmin/admin -w $KADMIN_PASS -q "ktadd host/$(hostname -f)"
+          set -x
+          MASTER_KDC=$(aws ssm get-parameter --region ${AWS::Region} --name PrimaryKdcFqdn --query Parameter.Value --output text);bash -c "echo host/$MASTER_KDC@${RealmName} > /var/kerberos/krb5kdc/kpropd.acl"
+          service krb5kdc start && chkconfig krb5kdc on
+          service kadmin start && chkconfig kadmin on
+          service kprop start && chkconfig kprop on
+          #/opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource KDCPrimaryInstance --region ${AWS::Region}
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref 'InstanceType'
+      SecurityGroupIds:
+        - !GetAtt 'KdcSecurityGroup.GroupId'
+        - !GetAtt 'KdcClientSecurityGroup.GroupId'
+      KeyName: !Ref 'KeyName'
+      SubnetId: !Ref 'SubnetIdSecondary'
+      IamInstanceProfile: !Ref 'Ec2KdcInstanceProfile'
+      Tags:
+        - Key: Name
+          Value: KDCReplicaInstance
+  KDCPrimaryInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      "AWS::CloudFormation::Init":
+        configSets:
+          setup:
+            - install_kdc_server
+        install_kdc_server:
+          packages:
+            yum:
+              krb5-server: []
+              krb5-workstation: []
+              krb5-libs: []
+          files:
+            "/var/kerberos/krb5kdc/kdc.conf":
+              content: !Sub |
+                default_realm = EC2.INTERNAL
+                [kdcdefaults]
+                 kdc_ports = 88
+                 kdc_tcp_ports = 88
+
+                [realms]
+                 EC2.INTERNAL = {
+                  master_key_type = des3-hmac-sha1
+                  #master_key_type = aes256-cts
+                  acl_file = /var/kerberos/krb5kdc/kadm5.acl
+                  dict_file = /usr/share/dict/words
+                  admin_keytab = /var/kerberos/krb5kdc/kadm5.keytab
+                  supported_enctypes = aes256-cts:normal aes128-cts:normal des3-hmac-sha1:normal arcfour-hmac:normal camellia256-cts:normal camellia128-cts:normal des-hmac-sha1:normal des-cbc-md5:normal des-cbc-crc:normal
+                 }
+              mode: "000644"
+              owner: "root"
+              group: "root"
+
+            "/etc/krb5.conf":
+              content: !Sub |
+                # Configuration snippets may be placed in this directory as well
+                includedir /etc/krb5.conf.d/
+
+                includedir /var/lib/sss/pubconf/krb5.include.d/
+                [logging]
+                 default = FILE:/var/log/krb5libs.log
+                 kdc = FILE:/var/log/krb5kdc.log
+                 admin_server = FILE:/var/log/kadmind.log
+
+                [libdefaults]
+                 dns_lookup_realm = false
+                 ticket_lifetime = 24h
+                 renew_lifetime = 7d
+                 forwardable = true
+                 rdns = false
+                 pkinit_anchors = /etc/pki/tls/certs/ca-bundle.crt
+                 default_realm = EC2.INTERNAL
+                 default_ccache_name = KEYRING:persistent:%{uid}
+
+                [realms]
+                 EC2.INTERNAL = {
+                  kdc = kdc-server1:88
+                  admin_server = kdc-server1:749
+                  default_domain = fqdnsuffix
+                 }
+                [domain_realm]
+                  .fqdnsuffix = EC2.INTERNAL
+                  fqdnsuffix = EC2.INTERNAL
+              mode: "000644"
+              owner: "root"
+              group: "root"
+
+            "/root/propagate_kdc_replica.sh":
+              content: !Sub |
+                #!/bin/sh
+                kdclist=replicahostname
+                /usr/sbin/kdb5_util dump /var/kerberos/krb5kdc/slave_datatrans
+                for kdc in $kdclist
+                do
+                    /usr/sbin/kprop $kdc
+                done
+              mode: "000744"
+              owner: "root"
+              group: "root"
+    Properties:
+      UserData:
+        # runs the cfn-init scripts
+        Fn::Base64:
+          !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource KDCPrimaryInstance --configsets setup --region ${AWS::Region}
+          sed -i 's/EC2.INTERNAL/${RealmName}/g' /etc/krb5.conf
+          sed -i 's/EC2.INTERNAL/${RealmName}/g' /var/kerberos/krb5kdc/kdc.conf
+          mkdir -p /var/lib/sss/pubconf/krb5.include.d/;mkdir -p /var/log/kerberos
+          HOSTNAME=$(hostname -f);sed -ie "s/kdc-server1/$HOSTNAME/g" /etc/krb5.conf
+          DOMAINNAME=$(hostname -f |awk -F. '{$1="";OFS="." ; print $0}' | sed 's/^.//');sed -ie "s/fqdnsuffix/$DOMAINNAME/g" /etc/krb5.conf
+          set +x
+          DB_PASS=$(aws secretsmanager --region ${AWS::Region} get-secret-value --secret-id ${SecretManagerMasterDbPassword} --query "SecretString" --output text);kdb5_util create -P $DB_PASS -s
+          KADMIN_PASS=$(aws secretsmanager --region ${AWS::Region} get-secret-value --secret-id ${SecretManagerKadminPassword} --query "SecretString" --output text);kadmin.local -q "cpw -pw $KADMIN_PASS kadmin/admin";kadmin.local -q "cpw -pw $KADMIN_PASS kadmin/$(hostname -f)"
+          #PRI_KDC=$(hostname -f);KRB_REALM=${RealmName};bash -c "echo host/$PRI_KDC@$KRB_REALM > /var/kerberos/krb5kdc/kpropd.acl"
+          set -x
+          bash -c 'echo "*/admin *" > /var/kerberos/krb5kdc/kadm5.acl'
+          service krb5kdc start && sudo chkconfig krb5kdc on
+          service kadmin start && sudo chkconfig kadmin on
+          service kprop start && sudo chkconfig kprop on
+          kadmin.local -q "add_principal -randkey host/$(hostname -f)"
+          kadmin.local -q "ktadd host/$(hostname -f)"
+          ssh-keygen -t rsa -f /root/.ssh/id_rsa -P ''
+          if [ ${HAforKdc} = True ] ;then
+            echo "*/2 * * * * /root/propagate_kdc_replica.sh 2>&1 | /usr/bin/logger -t CronJobForKDCReplication > /dev/null 2>&1" > /var/spool/cron/root
+            aws ssm put-parameter --region ${AWS::Region} --name "PrimaryKdcSshKey" --type "String" --value=file:///root/.ssh/id_rsa.pub --overwrite
+          fi
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource KDCPrimaryInstance --region ${AWS::Region}
+      ImageId: !Ref 'LatestAmiId'
+      InstanceType: !Ref 'InstanceType'
+      SecurityGroupIds:
+        - !GetAtt 'KdcSecurityGroup.GroupId'
+        - !GetAtt 'KdcClientSecurityGroup.GroupId'
+      KeyName: !Ref 'KeyName'
+      SubnetId: !Ref 'SubnetIdPrimary'
+      IamInstanceProfile: !Ref 'Ec2KdcInstanceProfile'
+      Tags:
+        -
+          Key: Name
+          Value: KDCPrimaryInstance
+  SsmParameterPrimaryKdc:
+    Condition: HAEnabled
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: PrimaryKdcFqdn
+      Type: String
+      Value: !GetAtt 'KDCPrimaryInstance.PrivateDnsName'
+  SsmParameterPrimaryKdcSshKey:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: PrimaryKdcSshKey
+      Type: String
+      Value: "dummykey"
+  SsmParameterReplicaKdc:
+    Condition: HAEnabled
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: ReplicaKdcFqdn
+      Type: String
+      Value: !GetAtt 'KDCReplicaInstance.PrivateDnsName'
+  KdcSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Description: "Security Group for  KDC servers"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: "Egress port80/443  to 0.0.0.0/0 is needed for the yum access"
+    Properties:
+      GroupDescription: Enable Kerberos and SSH access
+      VpcId: !Ref 'VPCId'
+      SecurityGroupEgress:
+        - Description: Allow HTTP outbound traffic for yum
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: Allow HTTPs outbound traffic for yum
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 749
+          ToPort: 749
+          SourceSecurityGroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+          Description: "From KDC clients to KDC server on port 749 KD5KDM admin port"
+        - IpProtocol: udp
+          FromPort: 749
+          ToPort: 749
+          Description: "From KDC clients to KDC server on port 749 KD5KDM admin port"
+          SourceSecurityGroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+        - IpProtocol: tcp
+          FromPort: 88
+          ToPort: 88
+          Description: "From KDC clients to KDC server on port 88 KDC  port"
+          SourceSecurityGroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+        - IpProtocol: udp
+          FromPort: 88
+          ToPort: 88
+          Description: "From KDC clients to KDC server on port 88 KDC  port"
+          SourceSecurityGroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+  KdcSecurityGroupIngressForPort754:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 754 Kprop ingress
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 754
+      ToPort: 754
+      IpProtocol: tcp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcSecurityGroupEgressForPort754:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 754 Kprop Egress
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 754
+      ToPort: 754
+      IpProtocol: tcp
+      DestinationSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcSecurityGroupIngressForPort749:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 749  ingress
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 749
+      ToPort: 749
+      IpProtocol: tcp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcSecurityGroupIngressForPort749Udp:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 749 ingress UDP
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 749
+      ToPort: 749
+      IpProtocol: udp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcSecurityGroupIngressForPort88:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 88  ingress
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 88
+      ToPort: 88
+      IpProtocol: tcp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcSecurityGroupIngressForPort88Udp:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 88 Kprop ingress
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 88
+      ToPort: 88
+      IpProtocol: udp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcSecurityGroupEgressForPort22:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 22 ssh  Egress to copy the config files
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 22
+      ToPort: 22
+      IpProtocol: tcp
+      DestinationSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcSecurityGroupIngressForPort22:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 22 ssh  Egress to copy the config files
+      GroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+      FromPort: 22
+      ToPort: 22
+      IpProtocol: tcp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable Kerberos and SSH access for clients
+      VpcId: !Ref 'VPCId'
+  KdcClientSecurityGroupEgressForPort88:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 88 Egress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 88
+      ToPort: 88
+      IpProtocol: tcp
+      DestinationSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroupEgressForPort88Udp:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 88 Egress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 88
+      ToPort: 88
+      IpProtocol: udp
+      DestinationSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroupEgressForPort749:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 749 Egress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 749
+      ToPort: 749
+      IpProtocol: tcp
+      DestinationSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroupEgressForPort749udp:
+    Type: AWS::EC2::SecurityGroupEgress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 749 Egress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 749
+      ToPort: 749
+      IpProtocol: udp
+      DestinationSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroupIngressForPort88:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 88 Ingress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 88
+      ToPort: 88
+      IpProtocol: tcp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroupIngressForPort88Udp:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 88 Ingress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 88
+      ToPort: 88
+      IpProtocol: udp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroupIngressForPort749:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 749 Ingress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 749
+      ToPort: 749
+      IpProtocol: tcp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  KdcClientSecurityGroupIngressForPort749udp:
+    Type: AWS::EC2::SecurityGroupIngress
+    DependsOn: KdcSecurityGroup
+    Properties:
+      Description: Port 749 Egress
+      GroupId: !GetAtt 'KdcClientSecurityGroup.GroupId'
+      FromPort: 749
+      ToPort: 749
+      IpProtocol: udp
+      SourceSecurityGroupId: !GetAtt 'KdcSecurityGroup.GroupId'
+  SecretManagerMasterDbPassword:
+    Type: 'AWS::SecretsManager::Secret'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: "This stack uses default KMS Key, there is no option specify default KMS Key ID"
+    Properties:
+      Name: KdcMasterDbPassword
+      Description: This secret is the password for the master DB for KDC
+      SecretString: !Ref 'KDCMasterDBPassword'
+  KdcMasterDbSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref 'SecretManagerMasterDbPassword'
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Resource: "*"
+            Action: "secretsmanager:GetSecretValue"
+            Effect: Allow
+            Principal:
+              "AWS" : !GetAtt 'Ec2KdcRole.Arn'
+  SecretManagerKadminPassword:
+    Type: 'AWS::SecretsManager::Secret'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W77
+            reason: "This stack uses default KMS Key, there is no option specify default KMS Key ID"
+    Properties:
+      Name: KadminPassword
+      Description: This secret is the password for the master DB for KDC
+      SecretString: !Ref 'KAdminPassword'
+  KdcKadminSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref 'SecretManagerKadminPassword'
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Resource: "*"
+            Action: "secretsmanager:GetSecretValue"
+            Effect: Allow
+            Principal:
+              "AWS": !GetAtt 'Ec2KdcRole.Arn'
+  Ec2KdcRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Role created with explicit name to allow more than one stack to be created independently in GLobal IAM"
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-Ec2KdcRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+  Ec2KdcInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-KdcEc2InstanceProfile
+      Path: /
+      Roles:
+        - !Ref 'Ec2KdcRole'
+  Ec2KdcRolePolicies:
+    Type: AWS::IAM::Policy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W12
+            reason: "Resources are *, but condition statements are added to restrict the prmission only to the resources created by the stack"
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-Ec2PermissionsForUserDataCommands
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: [
+                "secretsmanager:GetResourcePolicy",
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret",
+                "secretsmanager:ListSecretVersionIds"
+            ]
+            Resource: [
+              !Ref 'SecretManagerMasterDbPassword',
+              !Ref 'SecretManagerKadminPassword'
+            ]
+          - Effect: Allow
+            Action: [
+                "ssm:PutParameter",
+                "ssm:GetParameter",
+                "ssm:GetParametersByPath"
+            ]
+            Resource: '*'
+            Condition:
+              StringEquals:
+                  aws:ResourceTag/aws:cloudformation:stack-name : !Ref 'AWS::StackName'
+          - Effect: Allow
+            Action: [
+                "ssm:ListDocuments",
+                "ssm:DescribeDocument*",
+                "ssm:GetDocument",
+                "ssm:DescribeInstance*",
+                "ssm:ListCommands",
+                "ssm:ListCommandInvocations",
+                "ec2:DescribeInstanceStatus"
+            ]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/aws:cloudformation:stack-name: !Ref 'AWS::StackName'
+          - Effect: Allow
+            Action: [
+                "ssm:SendCommand"
+            ]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/aws:cloudformation:stack-name: !Ref 'AWS::StackName'
+          - Effect: Allow
+            Action: [
+                "ssm:SendCommand",
+                "ssm:CancelCommand"
+            ]
+            Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+      Roles:
+        - !Ref 'Ec2KdcRole'
+Outputs:
+  PrimaryKerberosInstance:
+    Description: FQDN for Primary KDC Server
+    Value: !GetAtt KDCPrimaryInstance.PrivateDnsName
+  SecondaryKerberosInstance:
+    Description: FQDN for  Secondary KDC Server
+    Value: !GetAtt KDCReplicaInstance.PrivateDnsName
+    Condition: HAEnabled
+  KdcDbPassword:
+    Description: Password for KDC DB
+    Value: !Ref SecretManagerMasterDbPassword
+  KdcAdminPassword:
+    Description: Password for Admin kadmin/admin@${REALMNAME}
+    Value: !Ref SecretManagerMasterDbPassword
+  KerberosClientSecurityGroup:
+    Description: Client Security Group for Kerberos Access
+    Value: !Ref KdcClientSecurityGroup
